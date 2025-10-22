@@ -3,11 +3,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
+
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _activation(name: str) -> nn.Module:
@@ -264,6 +269,66 @@ class YOLOv11DualHead(nn.Module):
     def predict(self, image: torch.Tensor, pbr_map: torch.Tensor) -> ModelOutput:
         self.eval()
         return self.forward(image, pbr_map)
+
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        prefixes: Tuple[str, ...] = ("model.", "module.")
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+        return key
+
+    def load_pretrained_weights(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        strict: bool = False,
+    ) -> Tuple[List[str], List[str]]:
+        """Load weights from a YOLOv11-small-seg checkpoint, remapping segmentation head layers."""
+
+        model_state = self.state_dict()
+        remapped_state: Dict[str, torch.Tensor] = {}
+        loaded_keys: List[str] = []
+        skipped_keys: List[str] = []
+
+        for raw_key, value in state_dict.items():
+            key = self._normalize_key(raw_key)
+            if "pbr_head" in key:
+                skipped_keys.append(raw_key)
+                continue
+
+            target_key = key
+            if "seg_head" not in key and "head" in key:
+                candidate = key.replace("head", "seg_head")
+                if candidate in model_state:
+                    target_key = candidate
+                else:
+                    skipped_keys.append(raw_key)
+                    continue
+
+            if target_key in model_state:
+                remapped_state[target_key] = value
+                loaded_keys.append(raw_key if target_key == key else f"{raw_key}->{target_key}")
+            else:
+                skipped_keys.append(raw_key)
+
+        missing_keys, unexpected_keys = nn.Module.load_state_dict(self, remapped_state, strict=strict)
+
+        LOGGER.info(
+            "Loaded pretrained weights for backbone, neck, and segmentation head. Layers: %d",
+            len(remapped_state),
+        )
+        LOGGER.info(
+            "PBR head initialized from scratch. Skipped layers: %d (missing=%d, unexpected=%d)",
+            len(skipped_keys),
+            len(missing_keys),
+            len(unexpected_keys),
+        )
+
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("Loaded keys: %s", loaded_keys)
+            LOGGER.debug("Skipped keys: %s", skipped_keys)
+
+        return missing_keys, unexpected_keys
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> "YOLOv11DualHead":

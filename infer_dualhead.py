@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Dict
 
@@ -13,6 +14,9 @@ from torchvision import transforms
 
 from models.yolov11_dualhead import YOLOv11DualHead
 from utils.data import PBR_CLASS_NAMES
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,11 +57,16 @@ def build_transforms(imgsz: int) -> transforms.Compose:
     )
 
 
-def load_checkpoint(weights: Path, device: torch.device) -> Dict:
+def load_checkpoint(weights: Path, device: torch.device) -> Dict[str, torch.Tensor]:
     checkpoint = torch.load(weights, map_location=device)
-    if "model_state_dict" in checkpoint:
-        return checkpoint
-    return {"model_state_dict": checkpoint}
+    candidates = ("model_state_dict", "model", "state_dict")
+    if isinstance(checkpoint, dict):
+        for key in candidates:
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+        return {k: v for k, v in checkpoint.items() if isinstance(v, torch.Tensor)}
+    raise ValueError(f"Unsupported checkpoint format from {weights}")
 
 
 def save_mask(mask: torch.Tensor, path: Path, palette: np.ndarray | None = None) -> str:
@@ -73,6 +82,7 @@ def save_mask(mask: torch.Tensor, path: Path, palette: np.ndarray | None = None)
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     device = select_device(args.device)
 
     data_cfg = load_yaml(args.data)
@@ -88,7 +98,12 @@ def main() -> None:
 
     model = YOLOv11DualHead(seg_classes=seg_classes, pbr_classes=pbr_classes)
     checkpoint = load_checkpoint(args.weights, device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if any("pbr_head" in key for key in checkpoint):
+        model.load_state_dict(checkpoint, strict=False)
+        LOGGER.info("Loaded full dual-head checkpoint including PBR head from %s", args.weights)
+    else:
+        LOGGER.info("Checkpoint missing PBR head weights. Loading backbone/neck/segmentation head from %s", args.weights)
+        model.load_pretrained_weights(checkpoint, strict=False)
     model.to(device)
     model.eval()
 

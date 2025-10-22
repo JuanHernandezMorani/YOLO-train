@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 import shutil
 import subprocess
@@ -27,6 +28,9 @@ from utils.data import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train YOLOv11 dual-head multi-task model")
     parser.add_argument("--data", type=Path, default=Path("dataset.yaml"), help="Dataset configuration file")
@@ -41,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision (overrides config)")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision (overrides config)")
     parser.add_argument("--tune-loss-weights", action="store_true", help="Search optimal PBR loss weight before training")
+    parser.add_argument(
+        "--pretrained",
+        type=Path,
+        default=None,
+        help="Pretrained checkpoint to initialize backbone/segmentation head",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +65,19 @@ def select_device(preferred: str | None = None) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def extract_model_state(checkpoint: Dict) -> Dict[str, torch.Tensor]:
+    """Return the model state dict from a serialized checkpoint."""
+
+    candidates = ("model_state_dict", "model", "state_dict")
+    for key in candidates:
+        value = checkpoint.get(key)
+        if isinstance(value, dict):
+            return value
+
+    # Fallback: keep tensor-like entries only
+    return {k: v for k, v in checkpoint.items() if isinstance(v, torch.Tensor)}
 
 
 def set_seed(seed: int = 42, deterministic: bool = True) -> None:
@@ -365,6 +388,7 @@ def export_training_artifacts(run_dir: Path, dataset, model_cfg: Dict, data_cfg:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     model_cfg = load_yaml(args.model_config)
     data_cfg = load_yaml(args.data)
 
@@ -444,6 +468,21 @@ def main() -> None:
     val_loader = create_dataloader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = YOLOv11DualHead(seg_classes=seg_classes, pbr_classes=pbr_classes)
+
+    pretrained_setting = args.pretrained or training_cfg.get("pretrained")
+    if pretrained_setting:
+        pretrained_path = Path(pretrained_setting).expanduser()
+        if pretrained_path.exists():
+            LOGGER.info("Loading pretrained checkpoint from %s", pretrained_path)
+            checkpoint = torch.load(pretrained_path, map_location="cpu")
+            state_dict = extract_model_state(checkpoint)
+            model.load_pretrained_weights(state_dict, strict=False)
+        else:
+            LOGGER.warning(
+                "Pretrained checkpoint %s was not found. Continuing without loading weights.",
+                pretrained_path,
+            )
+
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr0, weight_decay=weight_decay, betas=(momentum, 0.999))

@@ -59,6 +59,7 @@ model:
       segmentation: 1.0
       pbr: 0.3
     tune_loss_weights: false
+    pretrained: weights/YOLOv11-small-seg.pt
   augmentation:
     pixel_art:
       horizontal_flip: true
