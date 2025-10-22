@@ -1,0 +1,49 @@
+path: dataset
+train: images/train
+val: images/val
+labels:
+  train: labels/train
+  val: labels/val
+pbr_maps:
+  train: PBRmaps/train
+  val: PBRmaps/val
+segmentation:
+  num_classes: 18
+  class_names:
+    - background
+    - head
+    - body
+    - arms
+    - legs
+    - eyes
+    - mouth
+    - accessory
+    - weapon
+    - hair
+    - outfit
+    - armor
+    - pet
+    - vehicle
+    - environment
+    - platform
+    - collectible
+    - effect
+pbr_fusion:
+  num_classes: 16
+  class_names:
+    - ao
+    - curvature
+    - emissive
+    - fuzz
+    - height
+    - ior
+    - material
+    - metallic
+    - normal
+    - opacity
+    - porosity
+    - roughness
+    - specular
+    - structural
+    - subsurface
+    - transmission

@@ -1,0 +1,78 @@
+model:
+  name: yolov11-dualhead
+  backbone:
+    type: CSPDarknet
+    depth_multiple: 0.33
+    width_multiple: 0.5
+    activation: silu
+    layers:
+      - [Conv, 64, 3, 2]
+      - [C3, 64, 1]
+      - [Conv, 128, 3, 2]
+      - [C3, 128, 2]
+      - [Conv, 256, 3, 2]
+      - [C3, 256, 3]
+      - [Conv, 512, 3, 2]
+      - [C3, 512, 1]
+  neck:
+    type: PANFPN
+    layers:
+      - [Conv, 256, 1, 1]
+      - [Upsample, None, 2]
+      - [Concat, -1, 1]
+      - [C3, 256, 1]
+      - [Conv, 128, 1, 1]
+      - [Upsample, None, 2]
+      - [Concat, -1, 1]
+      - [C3, 128, 1]
+      - [Conv, 128, 3, 2]
+      - [Concat, -1, 1]
+      - [C3, 256, 1]
+      - [Conv, 256, 3, 2]
+      - [Concat, -1, 1]
+      - [C3, 512, 1]
+  heads:
+    seg_head:
+      type: SegmentationHead
+      num_classes: 18
+      task: segmentation
+      upsample_scales: [2, 4]
+    pbr_head:
+      type: ClassificationHead
+      num_classes: 16
+      task: pbr_fusion
+      pooling: avg
+  training:
+    imgsz: 640
+    epochs: 120
+    batch: 8
+    optimizer: AdamW
+    lr0: 0.001
+    momentum: 0.937
+    weight_decay: 0.0005
+    warmup_epochs: 3.0
+    amp: true
+    scheduler: cosine
+    early_stop_patience: 15
+    deterministic: true
+    loss_weights:
+      segmentation: 1.0
+      pbr: 0.3
+    tune_loss_weights: false
+  augmentation:
+    pixel_art:
+      horizontal_flip: true
+      vertical_flip: true
+      discrete_rotations: true
+      color_jitter: 0.1
+      avoid_blur: true
+  logging:
+    dir: runs/dualhead_pixel_pbr
+    save_period: 5
+    export_artifacts: true
+    metrics:
+      - mask_mAP
+      - mask_IoU
+      - pbr_accuracy
+      - pbr_f1
+    checkpoint: best
