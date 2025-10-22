@@ -7,6 +7,7 @@ import logging
 import random
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Tuple
@@ -19,6 +20,26 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import GPUtil
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    GPUtil = None
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    psutil = None
+
+from collections import deque
+from datetime import datetime
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
 from models.yolov11_dualhead import YOLOv11DualHead
 from utils.data import (
     DualHeadPixelPBRDataset,
@@ -29,6 +50,158 @@ from utils.data import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class LiveLogHandler(logging.Handler):
+    """Collect log records for live console rendering."""
+
+    def __init__(self, buffer: deque[str], lock: threading.Lock, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.buffer = buffer
+        self.lock = lock
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - interactive output
+        msg = self.format(record)
+        with self.lock:
+            self.buffer.append(msg)
+
+
+def _format_uptime(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class ResourceMonitor:
+    """Gather and render real-time system metrics for the live dashboard."""
+
+    def __init__(self, start_time: float) -> None:
+        self.start_time = start_time
+        self._lock = threading.Lock()
+        self._last_disk = psutil.disk_io_counters() if psutil else None
+        self._last_time = time.time()
+        if psutil:
+            psutil.cpu_percent(interval=None)  # Prime internal state
+        self._amdgpu_available = shutil.which("amdgpu_top") is not None
+
+    def _gpu_metrics(self) -> dict[str, str]:  # pragma: no cover - hardware dependent
+        if GPUtil is not None:
+            try:
+                gpus = GPUtil.getGPUs()
+            except Exception:
+                gpus = []
+            if gpus:
+                gpu = gpus[0]
+                load = float(gpu.load or 0.0) * 100
+                memory_total = float(getattr(gpu, "memoryTotal", 0.0))
+                memory_used = float(getattr(gpu, "memoryUsed", 0.0))
+                temperature = getattr(gpu, "temperature", None)
+                return {
+                    "load": load,
+                    "rest": max(0.0, 100.0 - load),
+                    "memory_used": memory_used,
+                    "memory_total": memory_total,
+                    "temperature": temperature,
+                    "name": getattr(gpu, "name", "GPU"),
+                }
+
+        if self._amdgpu_available:
+            try:
+                result = subprocess.run(
+                    ["amdgpu_top", "--json", "-n", "1"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                    check=False,
+                )
+                if result.stdout:
+                    data = json.loads(result.stdout)
+                    gpus = data.get("Devices") or data.get("devices")
+                    if gpus:
+                        gpu_data = gpus[0]
+                        load = float(gpu_data.get("GPU Busy", {}).get("value", 0.0))
+                        temperature = gpu_data.get("Temperature", {}).get("value")
+                        vram = gpu_data.get("VRAM", {})
+                        memory_used = float(vram.get("used", 0.0))
+                        memory_total = float(vram.get("total", 0.0))
+                        return {
+                            "load": load,
+                            "rest": max(0.0, 100.0 - load),
+                            "memory_used": memory_used,
+                            "memory_total": memory_total,
+                            "temperature": temperature,
+                            "name": gpu_data.get("name", "GPU"),
+                        }
+            except Exception:
+                return {}
+
+        return {}
+
+    def render(self) -> Panel:  # pragma: no cover - interactive output
+        now = time.time()
+        cpu_line = "CPU: N/A"
+        ram_line = "RAM: N/A"
+        disk_line = "Disco: N/A"
+        if psutil:
+            cpu_percent = psutil.cpu_percent(interval=None)
+            cpu_line = f"CPU: {cpu_percent:.0f}%"
+
+            virtual_mem = psutil.virtual_memory()
+            ram_line = (
+                f"RAM: {virtual_mem.used / (1024 ** 3):.1f}/{virtual_mem.total / (1024 ** 3):.1f} GB"
+            )
+
+            if self._last_disk:
+                disk_counters = psutil.disk_io_counters()
+                delta_time = max(now - self._last_time, 1e-6)
+                read_rate = (disk_counters.read_bytes - self._last_disk.read_bytes) / delta_time
+                write_rate = (disk_counters.write_bytes - self._last_disk.write_bytes) / delta_time
+                disk_line = (
+                    f"Disco: {write_rate / (1024 ** 2):.0f} MB/s W | {read_rate / (1024 ** 2):.0f} MB/s R"
+                )
+                with self._lock:
+                    self._last_disk = disk_counters
+                    self._last_time = now
+
+        gpu_data = self._gpu_metrics()
+        if gpu_data:
+            rest = gpu_data.get("rest", 0.0)
+            if rest < 10:
+                rest_style = "green"
+            elif rest <= 30:
+                rest_style = "yellow"
+            else:
+                rest_style = "red"
+            load = gpu_data.get("load", 0.0)
+            temp = gpu_data.get("temperature")
+            mem_used = gpu_data.get("memory_used", 0.0)
+            mem_total = gpu_data.get("memory_total", 0.0)
+            if mem_total > 0 and mem_total <= 64:  # assume GB if <= 64 (amdgpu_top)
+                mem_line = f"{mem_used:.1f}/{mem_total:.1f} GB"
+            else:
+                mem_line = f"{mem_used / 1024:.1f}/{mem_total / 1024:.1f} GB"
+            temp_text = f" | {temp:.0f}°C" if temp is not None else ""
+            gpu_line = Text.assemble(
+                ("GPU: ", "bold"),
+                f"{load:.0f}% uso | ",
+                (f"{rest:.0f}% descanso", rest_style),
+                temp_text,
+                f" | VRAM {mem_line}",
+            )
+        else:
+            gpu_line = Text("GPU: N/A", style="bold")
+
+        table = Table.grid(expand=True)
+        table.add_row(gpu_line)
+        table.add_row(Text(f"{cpu_line} | {ram_line}"))
+        table.add_row(Text(disk_line))
+
+        uptime = _format_uptime(now - self.start_time)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        table.add_row(Text(f"Uptime: {uptime} | Última actualización: {timestamp}", style="dim"))
+
+        return Panel(table, title="MONITOREO DE RECURSOS (actualiza cada 1s)", border_style="magenta")
 
 
 def parse_args() -> argparse.Namespace:
@@ -327,9 +500,9 @@ def find_optimal_loss_weights(
     best_iou = 0.0
     original_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    print("Starting loss weight search for PBR head...")
+    LOGGER.info("Starting loss weight search for PBR head...")
     for weight in candidates:
-        print(f"Testing PBR loss weight: {weight}")
+        LOGGER.info("Testing PBR loss weight: %s", weight)
         trial_weights = dict(base_weights)
         trial_weights["pbr"] = weight
         metrics = evaluate(
@@ -343,15 +516,18 @@ def find_optimal_loss_weights(
             pbr_classes,
             use_amp,
         )
-        print(
-            f"  -> Val Mask IoU: {metrics['mask_IoU']:.4f} | PBR Acc: {metrics['pbr_accuracy']:.4f} | Loss: {metrics['loss']:.4f}"
+        LOGGER.info(
+            "  -> Val Mask IoU: %.4f | PBR Acc: %.4f | Loss: %.4f",
+            metrics["mask_IoU"],
+            metrics["pbr_accuracy"],
+            metrics["loss"],
         )
         if metrics["mask_IoU"] > best_iou:
             best_iou = metrics["mask_IoU"]
             best_weight = weight
 
     model.load_state_dict(original_state)  # restore
-    print(f"Optimal PBR weight: {best_weight} (IoU: {best_iou:.4f})")
+    LOGGER.info("Optimal PBR weight: %s (IoU: %.4f)", best_weight, best_iou)
     return best_weight
 
 
@@ -388,237 +564,308 @@ def export_training_artifacts(run_dir: Path, dataset, model_cfg: Dict, data_cfg:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    model_cfg = load_yaml(args.model_config)
-    data_cfg = load_yaml(args.data)
 
-    training_cfg = model_cfg.get("training", {})
-    logging_cfg = model_cfg.get("logging", {})
-    epochs = args.epochs or training_cfg.get("epochs", 120)
-    batch_size = args.batch_size or training_cfg.get("batch", 8)
-    imgsz = training_cfg.get("imgsz", 640)
-    weight_decay = training_cfg.get("weight_decay", 5e-4)
-    lr0 = training_cfg.get("lr0", 1e-3)
-    momentum = training_cfg.get("momentum", 0.937)
-    warmup_epochs = training_cfg.get("warmup_epochs", 3.0)
-    loss_weights = training_cfg.get("loss_weights", {"segmentation": 1.0, "pbr": 0.3})
-    deterministic = training_cfg.get("deterministic", False)
-    early_stop_patience = training_cfg.get("early_stop_patience", 15)
-    scheduler_type = str(training_cfg.get("scheduler", "cosine")).lower()
-    tune_loss_weights = args.tune_loss_weights or training_cfg.get("tune_loss_weights", False)
+    console = Console()
+    log_buffer: deque[str] = deque(maxlen=200)
+    log_lock = threading.Lock()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
+    live_handler = LiveLogHandler(log_buffer, log_lock)
+    live_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root_logger = logging.getLogger()
+    root_logger.addHandler(live_handler)
 
-    run_dir = args.run_dir
-    checkpoints_dir = run_dir / "checkpoints"
-    metrics_dir = run_dir / "metrics"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-
-    set_seed(42, deterministic=deterministic)
-
-    device = select_device(args.device)
-    if device.type == "cuda":
-        print(f"Using device: {device} - {torch.cuda.get_device_name(device)}")
-        print(f"Torch version: {torch.__version__}; ROCm: {getattr(torch.version, 'hip', 'n/a')}")
-    else:
-        print(f"Using device: {device}")
-
-    use_amp = training_cfg.get("amp", True)
-    if args.amp:
-        use_amp = True
-    if args.no_amp:
-        use_amp = False
-
-    seg_cfg = data_cfg.get("segmentation", {})
-    pbr_cfg = data_cfg.get("pbr_fusion", {})
-    seg_classes = seg_cfg.get("num_classes", 18)
-    pbr_classes = pbr_cfg.get("num_classes", 16)
-
-    data_root = Path(data_cfg.get("path", "dataset"))
-    pbr_class_names = pbr_cfg.get("class_names", list(PBR_CLASS_NAMES))
-
-    train_dataset = DualHeadPixelPBRDataset(
-        root=data_root,
-        image_dir=data_root / data_cfg.get("train", "images/train"),
-        label_dir=data_root / data_cfg.get("labels", {}).get("train", "labels/train"),
-        pbr_dir=data_root / data_cfg.get("pbr_maps", {}).get("train", "PBRmaps/train"),
-        seg_classes=seg_classes,
-        pbr_class_names=pbr_class_names,
-        image_size=imgsz,
-        augment=True,
-        random_pbr=True,
+    start_time = time.time()
+    layout = Layout()
+    layout.split_column(Layout(name="logs", ratio=3), Layout(name="resources", ratio=1))
+    layout["logs"].update(
+        Panel(Text("Inicializando entrenamiento...", style="white"),
+              title="ENTRENAMIENTO YOLOv11 DUAL-HEAD",
+              border_style="cyan"),
     )
-    val_dataset = DualHeadPixelPBRDataset(
-        root=data_root,
-        image_dir=data_root / data_cfg.get("val", "images/val"),
-        label_dir=data_root / data_cfg.get("labels", {}).get("val", "labels/val"),
-        pbr_dir=data_root / data_cfg.get("pbr_maps", {}).get("val", "PBRmaps/val"),
-        seg_classes=seg_classes,
-        pbr_class_names=pbr_class_names,
-        image_size=imgsz,
-        augment=False,
-        random_pbr=False,
-    )
+    resource_monitor = ResourceMonitor(start_time)
+    layout["resources"].update(resource_monitor.render())
 
-    export_class_mappings(metrics_dir / "class_mappings.json", train_dataset)
-    if logging_cfg.get("export_artifacts", False):
-        export_training_artifacts(run_dir, train_dataset, model_cfg, data_cfg)
+    stop_event = threading.Event()
 
-    train_loader = create_dataloader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = create_dataloader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
+    def refresh_loop(live: Live) -> None:  # pragma: no cover - interactive output
+        while not stop_event.is_set():
+            with log_lock:
+                lines = list(log_buffer)
+            if lines:
+                display_lines = lines[-20:]
+                log_text = Text("\n".join(display_lines))
+            else:
+                log_text = Text("Esperando logs...", style="dim")
+            layout["logs"].update(
+                Panel(
+                    log_text,
+                    title="ENTRENAMIENTO YOLOv11 DUAL-HEAD",
+                    border_style="cyan",
+                )
+            )
+            layout["resources"].update(resource_monitor.render())
+            live.refresh()
+            time.sleep(1)
 
-    model = YOLOv11DualHead(seg_classes=seg_classes, pbr_classes=pbr_classes)
+    with Live(layout, console=console, refresh_per_second=4, screen=True) as live:
+        updater_thread = threading.Thread(target=refresh_loop, args=(live,), daemon=True)
+        updater_thread.start()
+        try:
+            model_cfg = load_yaml(args.model_config)
+            data_cfg = load_yaml(args.data)
 
-    pretrained_setting = args.pretrained or training_cfg.get("pretrained")
-    if pretrained_setting:
-        pretrained_path = Path(pretrained_setting).expanduser()
-        if pretrained_path.exists():
-            LOGGER.info("Loading pretrained checkpoint from %s", pretrained_path)
-            checkpoint = torch.load(pretrained_path, map_location="cpu")
-            state_dict = extract_model_state(checkpoint)
-            model.load_pretrained_weights(state_dict, strict=False)
-        else:
-            LOGGER.warning(
-                "Pretrained checkpoint %s was not found. Continuing without loading weights.",
-                pretrained_path,
+            training_cfg = model_cfg.get("training", {})
+            logging_cfg = model_cfg.get("logging", {})
+            epochs = args.epochs or training_cfg.get("epochs", 120)
+            batch_size = args.batch_size or training_cfg.get("batch", 8)
+            imgsz = training_cfg.get("imgsz", 640)
+            weight_decay = training_cfg.get("weight_decay", 5e-4)
+            lr0 = training_cfg.get("lr0", 1e-3)
+            momentum = training_cfg.get("momentum", 0.937)
+            warmup_epochs = training_cfg.get("warmup_epochs", 3.0)
+            loss_weights = training_cfg.get("loss_weights", {"segmentation": 1.0, "pbr": 0.3})
+            deterministic = training_cfg.get("deterministic", False)
+            early_stop_patience = training_cfg.get("early_stop_patience", 15)
+            scheduler_type = str(training_cfg.get("scheduler", "cosine")).lower()
+            tune_loss_weights = args.tune_loss_weights or training_cfg.get("tune_loss_weights", False)
+
+            run_dir = args.run_dir
+            checkpoints_dir = run_dir / "checkpoints"
+            metrics_dir = run_dir / "metrics"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            checkpoints_dir.mkdir(parents=True, exist_ok=True)
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+
+            set_seed(42, deterministic=deterministic)
+
+            device = select_device(args.device)
+            if device.type == "cuda":
+                LOGGER.info(
+                    "Using device: %s - %s",
+                    device,
+                    torch.cuda.get_device_name(device),
+                )
+                LOGGER.info(
+                    "Torch version: %s; ROCm: %s",
+                    torch.__version__,
+                    getattr(torch.version, "hip", "n/a"),
+                )
+            else:
+                LOGGER.info("Using device: %s", device)
+
+            use_amp = training_cfg.get("amp", True)
+            if args.amp:
+                use_amp = True
+            if args.no_amp:
+                use_amp = False
+
+            seg_cfg = data_cfg.get("segmentation", {})
+            pbr_cfg = data_cfg.get("pbr_fusion", {})
+            seg_classes = seg_cfg.get("num_classes", 18)
+            pbr_classes = pbr_cfg.get("num_classes", 16)
+
+            data_root = Path(data_cfg.get("path", "dataset"))
+            pbr_class_names = pbr_cfg.get("class_names", list(PBR_CLASS_NAMES))
+
+            train_dataset = DualHeadPixelPBRDataset(
+                root=data_root,
+                image_dir=data_root / data_cfg.get("train", "images/train"),
+                label_dir=data_root / data_cfg.get("labels", {}).get("train", "labels/train"),
+                pbr_dir=data_root / data_cfg.get("pbr_maps", {}).get("train", "PBRmaps/train"),
+                seg_classes=seg_classes,
+                pbr_class_names=pbr_class_names,
+                image_size=imgsz,
+                augment=True,
+                random_pbr=True,
+            )
+            val_dataset = DualHeadPixelPBRDataset(
+                root=data_root,
+                image_dir=data_root / data_cfg.get("val", "images/val"),
+                label_dir=data_root / data_cfg.get("labels", {}).get("val", "labels/val"),
+                pbr_dir=data_root / data_cfg.get("pbr_maps", {}).get("val", "PBRmaps/val"),
+                seg_classes=seg_classes,
+                pbr_class_names=pbr_class_names,
+                image_size=imgsz,
+                augment=False,
+                random_pbr=False,
             )
 
-    model.to(device)
+            export_class_mappings(metrics_dir / "class_mappings.json", train_dataset)
+            if logging_cfg.get("export_artifacts", False):
+                export_training_artifacts(run_dir, train_dataset, model_cfg, data_cfg)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr0, weight_decay=weight_decay, betas=(momentum, 0.999))
-    scaler = GradScaler(enabled=use_amp and device.type == "cuda")
+            train_loader = create_dataloader(
+                train_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers
+            )
+            val_loader = create_dataloader(
+                val_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers
+            )
 
-    scheduler = None
-    scheduler_step_per_batch = False
-    warmup_steps = 0
-    if warmup_epochs > 0:
-        warmup_steps = int(max(1, warmup_epochs * len(train_loader)))
-    use_warmup = scheduler_type != "onecycle" and warmup_steps > 0
-    if scheduler_type == "onecycle":
-        pct_start = warmup_epochs / max(epochs, 1)
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=lr0,
-            epochs=epochs,
-            steps_per_epoch=max(1, len(train_loader)),
-            pct_start=min(max(pct_start, 0.0), 0.9),
-        )
-        scheduler_step_per_batch = True
-        use_warmup = False
-        warmup_steps = 0
-    else:
-        t_max = max(1, int(max(1, epochs - int(round(warmup_epochs)))))
-        scheduler = CosineAnnealingLR(optimizer, T_max=t_max)
+            model = YOLOv11DualHead(seg_classes=seg_classes, pbr_classes=pbr_classes)
 
-    seg_loss_fn = nn.CrossEntropyLoss()
-    pbr_loss_fn = nn.CrossEntropyLoss()
+            pretrained_setting = args.pretrained or training_cfg.get("pretrained")
+            if pretrained_setting:
+                pretrained_path = Path(pretrained_setting).expanduser()
+                if pretrained_path.exists():
+                    LOGGER.info("Loading pretrained checkpoint from %s", pretrained_path)
+                    checkpoint = torch.load(pretrained_path, map_location="cpu")
+                    state_dict = extract_model_state(checkpoint)
+                    model.load_pretrained_weights(state_dict, strict=False)
+                else:
+                    LOGGER.warning(
+                        "Pretrained checkpoint %s was not found. Continuing without loading weights.",
+                        pretrained_path,
+                    )
 
-    if tune_loss_weights:
-        optimal_weight = find_optimal_loss_weights(
-            model,
-            val_loader,
-            device,
-            seg_loss_fn,
-            pbr_loss_fn,
-            loss_weights,
-            seg_classes,
-            pbr_classes,
-            use_amp,
-        )
-        loss_weights["pbr"] = optimal_weight
+            model.to(device)
 
-    writer = SummaryWriter(log_dir=run_dir)
-    best_score = 0.0
-    best_mask_mAP = 0.0
-    early_stop_counter = 0
-    global_step = 0
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr0, weight_decay=weight_decay, betas=(momentum, 0.999)
+            )
+            scaler = GradScaler(enabled=use_amp and device.type == "cuda")
 
-        train_metrics, global_step = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scaler,
-            device,
-            seg_loss_fn,
-            pbr_loss_fn,
-            loss_weights,
-            seg_classes,
-            pbr_classes,
-            use_amp,
-            scheduler=scheduler,
-            scheduler_step_per_batch=scheduler_step_per_batch,
-            warmup_steps=warmup_steps,
-            global_step=global_step,
-            base_lr=lr0,
-            use_warmup=use_warmup,
-        )
-        val_metrics = evaluate(
-            model,
-            val_loader,
-            device,
-            seg_loss_fn,
-            pbr_loss_fn,
-            loss_weights,
-            seg_classes,
-            pbr_classes,
-            use_amp,
-        )
+            scheduler = None
+            scheduler_step_per_batch = False
+            warmup_steps = 0
+            if warmup_epochs > 0:
+                warmup_steps = int(max(1, warmup_epochs * len(train_loader)))
+            use_warmup = scheduler_type != "onecycle" and warmup_steps > 0
+            if scheduler_type == "onecycle":
+                pct_start = warmup_epochs / max(epochs, 1)
+                scheduler = OneCycleLR(
+                    optimizer,
+                    max_lr=lr0,
+                    epochs=epochs,
+                    steps_per_epoch=max(1, len(train_loader)),
+                    pct_start=min(max(pct_start, 0.0), 0.9),
+                )
+                scheduler_step_per_batch = True
+                use_warmup = False
+                warmup_steps = 0
+            else:
+                t_max = max(1, int(max(1, epochs - int(round(warmup_epochs)))))
+                scheduler = CosineAnnealingLR(optimizer, T_max=t_max)
 
-        if scheduler and not scheduler_step_per_batch and (not use_warmup or global_step >= warmup_steps):
-            scheduler.step()
+            seg_loss_fn = nn.CrossEntropyLoss()
+            pbr_loss_fn = nn.CrossEntropyLoss()
 
-        elapsed = time.time() - start_time
-        print(
-            f"Epoch {epoch:03d}/{epochs} | Train Loss {train_metrics['loss']:.4f} | Val Loss {val_metrics['loss']:.4f} | "
-            f"Mask mAP {val_metrics['mask_mAP']:.4f} | PBR Acc {val_metrics['pbr_accuracy']:.4f} | Time {elapsed:.1f}s"
-        )
-        print(
-            f"Missing PBR rate: train {train_metrics.get('missing_pbr_rate', 0):.4f} | val {val_metrics.get('missing_pbr_rate', 0):.4f}"
-        )
+            if tune_loss_weights:
+                optimal_weight = find_optimal_loss_weights(
+                    model,
+                    val_loader,
+                    device,
+                    seg_loss_fn,
+                    pbr_loss_fn,
+                    loss_weights,
+                    seg_classes,
+                    pbr_classes,
+                    use_amp,
+                )
+                loss_weights["pbr"] = optimal_weight
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        train_metrics["optimal_lr"] = current_lr
-        val_metrics["optimal_lr"] = current_lr
-
-        writer_step = epoch
-        for key, value in train_metrics.items():
-            writer.add_scalar(f"train/{key}", value, writer_step)
-        for key, value in val_metrics.items():
-            writer.add_scalar(f"val/{key}", value, writer_step)
-
-        save_checkpoint(checkpoints_dir / "last.pt", model, optimizer, epoch, val_metrics)
-        if val_metrics["mask_mAP"] > best_score:
-            best_score = val_metrics["mask_mAP"]
-            save_checkpoint(checkpoints_dir / "best.pt", model, optimizer, epoch, val_metrics)
-        if val_metrics["mask_mAP"] > best_mask_mAP:
-            best_mask_mAP = val_metrics["mask_mAP"]
+            writer = SummaryWriter(log_dir=run_dir)
+            best_score = 0.0
+            best_mask_mAP = 0.0
             early_stop_counter = 0
-        else:
-            early_stop_counter += 1
+            global_step = 0
+            for epoch in range(1, epochs + 1):
+                epoch_start_time = time.time()
 
-        val_metrics["early_stop_counter"] = early_stop_counter
+                train_metrics, global_step = train_one_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    scaler,
+                    device,
+                    seg_loss_fn,
+                    pbr_loss_fn,
+                    loss_weights,
+                    seg_classes,
+                    pbr_classes,
+                    use_amp,
+                    scheduler=scheduler,
+                    scheduler_step_per_batch=scheduler_step_per_batch,
+                    warmup_steps=warmup_steps,
+                    global_step=global_step,
+                    base_lr=lr0,
+                    use_warmup=use_warmup,
+                )
+                val_metrics = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    seg_loss_fn,
+                    pbr_loss_fn,
+                    loss_weights,
+                    seg_classes,
+                    pbr_classes,
+                    use_amp,
+                )
 
-        epoch_metrics = {
-            "epoch": epoch,
-            "train": train_metrics,
-            "val": val_metrics,
-        }
-        metrics_path = metrics_dir / f"epoch_{epoch:03d}.json"
-        with metrics_path.open("w", encoding="utf-8") as handle:
-            json.dump(epoch_metrics, handle, indent=2)
+                if scheduler and not scheduler_step_per_batch and (not use_warmup or global_step >= warmup_steps):
+                    scheduler.step()
 
-        save_period = logging_cfg.get("save_period", 5)
-        if epoch % save_period == 0:
-            save_checkpoint(checkpoints_dir / f"epoch_{epoch:03d}.pt", model, optimizer, epoch, val_metrics)
+                elapsed = time.time() - epoch_start_time
+                LOGGER.info(
+                    "Epoch %03d/%d | Train Loss %.4f | Val Loss %.4f | Mask mAP %.4f | PBR Acc %.4f | Time %.1fs",
+                    epoch,
+                    epochs,
+                    train_metrics["loss"],
+                    val_metrics["loss"],
+                    val_metrics["mask_mAP"],
+                    val_metrics["pbr_accuracy"],
+                    elapsed,
+                )
+                LOGGER.info(
+                    "Missing PBR rate: train %.4f | val %.4f",
+                    train_metrics.get("missing_pbr_rate", 0.0),
+                    val_metrics.get("missing_pbr_rate", 0.0),
+                )
 
-        if early_stop_counter >= early_stop_patience:
-            print(f"Early stopping at epoch {epoch}. Best mAP: {best_mask_mAP:.4f}")
-            break
+                current_lr = optimizer.param_groups[0]["lr"]
+                train_metrics["optimal_lr"] = current_lr
+                val_metrics["optimal_lr"] = current_lr
 
-    writer.close()
-    print("Training finished. Checkpoints saved to", checkpoints_dir)
+                writer_step = epoch
+                for key, value in train_metrics.items():
+                    writer.add_scalar(f"train/{key}", value, writer_step)
+                for key, value in val_metrics.items():
+                    writer.add_scalar(f"val/{key}", value, writer_step)
+
+                save_checkpoint(checkpoints_dir / "last.pt", model, optimizer, epoch, val_metrics)
+                if val_metrics["mask_mAP"] > best_score:
+                    best_score = val_metrics["mask_mAP"]
+                    save_checkpoint(checkpoints_dir / "best.pt", model, optimizer, epoch, val_metrics)
+                if val_metrics["mask_mAP"] > best_mask_mAP:
+                    best_mask_mAP = val_metrics["mask_mAP"]
+                    early_stop_counter = 0
+                else:
+                    early_stop_counter += 1
+
+                val_metrics["early_stop_counter"] = early_stop_counter
+
+                epoch_metrics = {
+                    "epoch": epoch,
+                    "train": train_metrics,
+                    "val": val_metrics,
+                }
+                metrics_path = metrics_dir / f"epoch_{epoch:03d}.json"
+                with metrics_path.open("w", encoding="utf-8") as handle:
+                    json.dump(epoch_metrics, handle, indent=2)
+
+                save_period = logging_cfg.get("save_period", 5)
+                if epoch % save_period == 0:
+                    save_checkpoint(checkpoints_dir / f"epoch_{epoch:03d}.pt", model, optimizer, epoch, val_metrics)
+
+                if early_stop_counter >= early_stop_patience:
+                    LOGGER.info("Early stopping at epoch %d. Best mAP: %.4f", epoch, best_mask_mAP)
+                    break
+
+            writer.close()
+            LOGGER.info("Training finished. Checkpoints saved to %s", checkpoints_dir)
+        finally:
+            stop_event.set()
+            updater_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
